@@ -1,5 +1,10 @@
+mod adapters;
+mod models;
+
+use crate::adapters::local_storage;
+use crate::models::{Request, Response, StatusCode};
+
 use clap::Parser;
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
@@ -11,54 +16,92 @@ struct Args {
     directory: String,
 }
 
-#[allow(dead_code)]
-#[derive(Debug)]
-struct Request {
-    method: String,
-    path: String,
-    version: String,
-    headers: HashMap<String, String>,
-    body: String,
+fn handle_root(mut stream: &TcpStream) {
+    stream
+        .write(
+            &Response::new(
+                StatusCode::OK,
+                Some(vec![("Content-Encoding", "gzip")]),
+                None,
+            )
+            .to_bytes(),
+        )
+        .unwrap();
 }
 
-impl Request {
-    fn new_from_buffer(buffer: &[u8]) -> Request {
-        let buffer_string = String::from_utf8_lossy(buffer);
-        let start_line = buffer_string.lines().next().unwrap();
-        let mut start_line_parts = start_line.split_whitespace();
-        let method = start_line_parts.next().unwrap();
-        let path = start_line_parts.next().unwrap();
+fn handle_echo_path(mut stream: &TcpStream, echo_path: &str, compress: bool) {
+    let echo_path_len = echo_path.len().to_string();
+    let mut response_headers = vec![
+        ("Content-Type", "text/plain"),
+        ("Content-Length", &echo_path_len),
+    ];
+    if compress {
+        response_headers.push(("Content-Encoding", "gzip"));
+    }
+    stream
+        .write(
+            &Response::new(
+                StatusCode::OK,
+                Some(response_headers),
+                Some(echo_path.to_string()),
+            )
+            .to_bytes(),
+        )
+        .unwrap();
+}
 
-        let mut headers = HashMap::new();
-        for line in buffer_string
-            .split("\r\n\r\n")
-            .next()
-            .unwrap()
-            .lines()
-            .skip(1)
-        {
-            if line.is_empty() {
-                break;
-            }
-            let mut parts = line.splitn(2, ": ");
-            let key = parts.next().unwrap();
-            let value = parts.next().unwrap();
-            headers.insert(key.to_string(), value.to_string());
+fn handle_echo_user_agent(mut stream: &TcpStream, user_agent: &str) {
+    stream
+        .write(
+            &Response::new(
+                StatusCode::OK,
+                Some(vec![
+                    ("Content-Type", "text/plain"),
+                    ("Content-Length", &format!("{}", user_agent.len())),
+                ]),
+                Some(user_agent.to_string()),
+            )
+            .to_bytes(),
+        )
+        .unwrap();
+}
+
+fn handle_get_file(mut stream: &TcpStream, file_path: String) {
+    match local_storage::read_file_to_string(file_path) {
+        Ok(file_content) => {
+            stream
+                .write(
+                    &Response::new(
+                        StatusCode::OK,
+                        Some(vec![
+                            ("Content-Type", "application/octet-stream"),
+                            ("Content-Length", &file_content.len().to_string()),
+                        ]),
+                        Some(file_content),
+                    )
+                    .to_bytes(),
+                )
+                .unwrap();
         }
+        Err(_) => {
+            stream
+                .write(&Response::new_from_status_code(StatusCode::NotFound).to_bytes())
+                .unwrap();
+        }
+    }
+}
 
-        Request {
-            method: method.to_string(),
-            path: path.to_string(),
-            version: headers
-                .get("HTTP/1.1")
-                .unwrap_or(&"HTTP/1.1".to_string())
-                .to_string(),
-            headers,
-            body: buffer_string
-                .split("\r\n\r\n")
-                .nth(1)
-                .unwrap_or(&"".to_string())
-                .to_string(),
+fn handle_post_file(mut stream: &TcpStream, file_path: String, contents: String) {
+    match local_storage::write_file_to_string(file_path, contents) {
+        Ok(_) => {
+            stream
+                .write(&Response::new_from_status_code(StatusCode::Created).to_bytes())
+                .unwrap();
+        }
+        Err(_) => {
+            stream
+                .write(&Response::new_from_status_code(StatusCode::InternalServerError).to_bytes())
+                .unwrap();
         }
     }
 }
@@ -68,68 +111,38 @@ fn connection_handler(mut stream: TcpStream, config: Args) {
     stream.read(buffer).unwrap();
     let request = Request::new_from_buffer(buffer);
     match request.path.as_str() {
-        "/" => {
-            stream.write(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
-        }
-        path if path.starts_with("/echo") => {
-            let echo_path = path.strip_prefix("/echo/").unwrap();
-            stream
-                .write(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                        echo_path.len(),
-                        echo_path
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
-        }
+        "/" => handle_root(&stream),
+        path if path.starts_with("/echo") => handle_echo_path(
+            &stream,
+            path.strip_prefix("/echo/").unwrap(),
+            request.has_content_encoding_gzip(),
+        ),
         path if path.starts_with("/user-agent") => {
-            stream
-                .write(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
-                        request.headers.get("User-Agent").unwrap().len(),
-                        request.headers.get("User-Agent").unwrap()
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
+            handle_echo_user_agent(&stream, request.headers.get("User-Agent").unwrap())
         }
         path if path.starts_with("/files") => match request.method.as_str() {
-            "GET" => {
-                let file_path = config.directory + path.strip_prefix("/files/").unwrap();
-                if !std::path::Path::new(&file_path).exists() {
-                    stream.write(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap();
-                    return;
-                }
-                let contents = std::fs::read_to_string(file_path).unwrap();
-                stream.write(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n{}",
-                        contents.len(),
-                        contents
-                    ).as_bytes(),
-                ).unwrap();
-            }
-            "POST" => {
-                let file_path = config.directory + path.strip_prefix("/files/").unwrap();
-                let contents = request.body.trim_end_matches('\0').to_string();
-                std::fs::write(file_path, contents).unwrap();
-                stream.write("HTTP/1.1 201 OK\r\n\r\n".as_bytes()).unwrap();
-            }
+            "GET" => handle_get_file(
+                &stream,
+                config.directory + path.strip_prefix("/files/").unwrap(),
+            ),
+            "POST" => handle_post_file(
+                &stream,
+                config.directory + path.strip_prefix("/files/").unwrap(),
+                request.body.trim_end_matches('\0').to_string(),
+            ),
             _ => {
                 stream
-                    .write(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+                    .write(&Response::new_from_status_code(StatusCode::MethodNotAllowed).to_bytes())
                     .unwrap();
                 return;
             }
         },
         _ => {
-            stream.write(b"HTTP/1.1 404 Not Found\r\n\r\n").unwrap();
+            stream
+                .write(&Response::new_from_status_code(StatusCode::NotFound).to_bytes())
+                .unwrap();
         }
     }
-    stream.write(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
     stream.flush().unwrap();
 }
 
